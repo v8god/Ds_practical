@@ -1,0 +1,150 @@
+# =============================================================
+# main.py  —  Phase 3
+#
+# Added in this phase:
+#   - DrawingCanvas : air drawing + eraser overlay
+#
+# Gesture → action mapping so far:
+#   draw          → draw on canvas with index fingertip
+#   erase         → erase canvas content near fingertip
+#   click         → mouse click
+#   drag          → mouse drag
+#   select_start  → begin selection area
+#   select_end    → end selection area
+#   filter_next   → cycle to next filter
+#
+# Keyboard shortcuts:
+#   f → cycle filters
+#   l → toggle landmarks
+#   m → toggle mouse control
+#   c → clear canvas
+#   s → save drawing
+#   q → quit
+# =============================================================
+
+import cv2
+import config
+
+from modules.camera           import Camera
+from modules.filters          import FilterEngine
+from modules.hand_tracker     import HandTracker
+from modules.gesture_engine   import GestureEngine
+from modules.mouse_controller import MouseController
+from modules.drawing_canvas   import DrawingCanvas
+from utils.fps_counter        import FPSCounter
+
+
+def main():
+    # ----------------------------------------------------------
+    # SETUP
+    # ----------------------------------------------------------
+    cam     = Camera()
+    cam.open()
+
+    filters    = FilterEngine()
+    fps        = FPSCounter()
+    tracker    = HandTracker()
+    engine     = GestureEngine()
+    controller = MouseController()
+
+    # Canvas uses actual camera frame size (may differ from config if camera
+    # couldn't match exactly — we read it back after open())
+    canvas = DrawingCanvas(config.FRAME_WIDTH, config.FRAME_HEIGHT)
+
+    print(f"\n{'='*50}")
+    print(" AR Studio — Phase 3 Running")
+    print(f"{'='*50}")
+    print(" Gestures:")
+    print("   Index only      → draw in air")
+    print("   Closed fist     → erase")
+    print("   Thumb + Index   → mouse click")
+    print("   Index + Middle  → mouse drag")
+    print("   Open palm       → cycle filter")
+    print(" Keys:")
+    print("   f → filter  |  l → landmarks  |  m → mouse")
+    print("   c → clear   |  s → save       |  q → quit")
+    print(f"{'='*50}\n")
+
+    # ----------------------------------------------------------
+    # MAIN LOOP
+    # ----------------------------------------------------------
+    while True:
+
+        # 1. CAPTURE
+        frame = cam.read()
+        if frame is None:
+            print("[main] No frame received. Exiting.")
+            break
+
+        # 2. HAND TRACKING
+        landmarks = tracker.update(frame)
+
+        # 3. GESTURE DETECTION
+        gesture = engine.update(landmarks)
+
+        # 4. MOUSE CONTROL
+        #    Only move mouse when NOT drawing or erasing
+        #    (so drawing doesn't also move your cursor around)
+        if gesture not in ("draw", "erase"):
+            controller.update(landmarks, gesture)
+
+        # 5. GESTURE-TRIGGERED FILTER SWITCH
+        if gesture == "filter_next" and engine._prev_gesture != "filter_next":
+            filters.cycle()
+
+        # 6. APPLY VIDEO FILTER
+        frame = filters.apply(frame)
+
+        # 7. DRAWING CANVAS
+        #    Updates canvas state AND blends it onto frame
+        frame = canvas.update(frame, landmarks, gesture)
+
+        # 8. DRAW ALL OVERLAYS (order matters — drawn on top of canvas)
+        tracker.draw(frame)
+        engine.draw_hud(frame)
+        canvas.draw_hud(frame, gesture)
+
+        # Only show mouse cursor indicator when not drawing/erasing
+        if gesture not in ("draw", "erase"):
+            controller.draw_hud(frame, landmarks)
+
+        # 9. HUD
+        if config.SHOW_FPS:
+            fps.update()
+            fps.draw(frame)
+        filters.draw_hud(frame)
+
+        # Phase 4 will add: ar_3d.update(frame, canvas.strokes)
+        # Phase 5 will add: face_recognition.update(frame)
+        # Phase 6 will add: symbol_detector.update(frame)
+
+        # 10. SHOW
+        cv2.imshow(config.WINDOW_NAME, frame)
+
+        # 11. KEYBOARD
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == config.KEY_QUIT:
+            print("[main] Quit.")
+            break
+        elif key == config.KEY_CYCLE_FILTER:
+            filters.cycle()
+        elif key == config.KEY_TOGGLE_LANDMARKS:
+            tracker.toggle_landmarks()
+        elif key == config.KEY_CLEAR_CANVAS:
+            canvas.clear()
+        elif key == config.KEY_SAVE_DRAWING:
+            canvas.save()
+        elif key == ord('m'):
+            controller.toggle()
+
+    # ----------------------------------------------------------
+    # CLEANUP
+    # ----------------------------------------------------------
+    cam.release()
+    cv2.destroyAllWindows()
+    print("[main] Shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()

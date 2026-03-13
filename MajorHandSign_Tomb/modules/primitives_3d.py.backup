@@ -1,0 +1,574 @@
+# =============================================================
+# modules/primitives_3d.py
+#
+# 3D Primitive Shapes Engine
+#
+# SHAPES SUPPORTED:
+#   - Sphere    (radius)
+#   - Cuboid    (width, height, depth)
+#   - Cone      (radius, height)
+#   - Cylinder  (radius, height)
+#
+# HOW IT WORKS:
+#   1. Each shape is a mesh of 3D vertices + edges
+#   2. Vertices are generated mathematically (not from camera)
+#   3. Each frame: rotation matrix applied → perspective project → draw
+#   4. Shapes live in a scene list — add, select, delete individually
+#
+# CONTROLS (all from main.py):
+#   - Shape type cycling
+#   - Parameter adjustment (size, width, height, radius)
+#   - Place shape at screen center
+#   - Select shape (click near it)
+#   - Delete selected shape
+#   - Save scene to PNG
+#
+# COORDINATE SYSTEM:
+#   Each shape has its own local (x,y,z) center in scene space.
+#   Scene center = (0, 0, 0) = middle of screen.
+# =============================================================
+
+import cv2
+import numpy as np
+import math
+import json
+import os
+import datetime
+
+
+# ----------------------------------------------------------
+# MESH GENERATORS
+# Each returns (vertices, edges)
+#   vertices : list of (x, y, z) tuples
+#   edges    : list of (i, j) index pairs into vertices
+# ----------------------------------------------------------
+
+def make_sphere(radius=80, lat_steps=8, lon_steps=12):
+    """
+    Wireframe sphere using latitude/longitude lines.
+    lat_steps: number of horizontal rings
+    lon_steps: number of vertical slices
+    """
+    verts = []
+    edges = []
+
+    # Generate vertices on sphere surface
+    for lat in range(lat_steps + 1):
+        theta = math.pi * lat / lat_steps   # 0 to pi
+        for lon in range(lon_steps):
+            phi = 2 * math.pi * lon / lon_steps
+            x = radius * math.sin(theta) * math.cos(phi)
+            y = radius * math.cos(theta)
+            z = radius * math.sin(theta) * math.sin(phi)
+            verts.append((x, y, z))
+
+    # Latitude ring edges (horizontal circles)
+    for lat in range(lat_steps + 1):
+        for lon in range(lon_steps):
+            i = lat * lon_steps + lon
+            j = lat * lon_steps + (lon + 1) % lon_steps
+            edges.append((i, j))
+
+    # Longitude line edges (vertical arcs)
+    for lat in range(lat_steps):
+        for lon in range(lon_steps):
+            i = lat       * lon_steps + lon
+            j = (lat + 1) * lon_steps + lon
+            edges.append((i, j))
+
+    return verts, edges
+
+
+def make_cuboid(w=120, h=100, d=80):
+    """
+    Wireframe cuboid (box).
+    w = width (X), h = height (Y), d = depth (Z)
+    """
+    hw, hh, hd = w/2, h/2, d/2
+
+    verts = [
+        (-hw, -hh, -hd),  # 0 front-bottom-left
+        ( hw, -hh, -hd),  # 1 front-bottom-right
+        ( hw,  hh, -hd),  # 2 front-top-right
+        (-hw,  hh, -hd),  # 3 front-top-left
+        (-hw, -hh,  hd),  # 4 back-bottom-left
+        ( hw, -hh,  hd),  # 5 back-bottom-right
+        ( hw,  hh,  hd),  # 6 back-top-right
+        (-hw,  hh,  hd),  # 7 back-top-left
+    ]
+
+    edges = [
+        # Front face
+        (0,1),(1,2),(2,3),(3,0),
+        # Back face
+        (4,5),(5,6),(6,7),(7,4),
+        # Connecting edges
+        (0,4),(1,5),(2,6),(3,7),
+    ]
+
+    return verts, edges
+
+
+def make_cone(radius=70, height=140, steps=12):
+    """
+    Wireframe cone.
+    Base circle at y=+height/2, apex at y=-height/2.
+    """
+    verts  = []
+    edges  = []
+    apex   = (0, -height/2, 0)
+    apex_i = 0
+    verts.append(apex)
+
+    # Base circle vertices
+    base_start = 1
+    for i in range(steps):
+        angle = 2 * math.pi * i / steps
+        x = radius * math.cos(angle)
+        z = radius * math.sin(angle)
+        y = height / 2
+        verts.append((x, y, z))
+
+    # Base circle edges
+    for i in range(steps):
+        a = base_start + i
+        b = base_start + (i + 1) % steps
+        edges.append((a, b))
+
+    # Apex to base edges (every other to avoid clutter)
+    for i in range(0, steps, 2):
+        edges.append((apex_i, base_start + i))
+
+    return verts, edges
+
+
+def make_cylinder(radius=60, height=120, steps=12):
+    """
+    Wireframe cylinder.
+    Two circles (top and bottom) connected by vertical lines.
+    """
+    verts = []
+    edges = []
+    hh    = height / 2
+
+    # Bottom circle (y = +hh)
+    bottom_start = 0
+    for i in range(steps):
+        angle = 2 * math.pi * i / steps
+        x = radius * math.cos(angle)
+        z = radius * math.sin(angle)
+        verts.append((x, hh, z))
+
+    # Top circle (y = -hh)
+    top_start = steps
+    for i in range(steps):
+        angle = 2 * math.pi * i / steps
+        x = radius * math.cos(angle)
+        z = radius * math.sin(angle)
+        verts.append((x, -hh, z))
+
+    # Bottom circle edges
+    for i in range(steps):
+        edges.append((bottom_start + i,
+                      bottom_start + (i + 1) % steps))
+
+    # Top circle edges
+    for i in range(steps):
+        edges.append((top_start + i,
+                      top_start + (i + 1) % steps))
+
+    # Vertical connecting edges (every other to avoid clutter)
+    for i in range(0, steps, 2):
+        edges.append((bottom_start + i, top_start + i))
+
+    return verts, edges
+
+
+# Map shape name → generator function
+SHAPE_GENERATORS = {
+    "sphere":   make_sphere,
+    "cuboid":   make_cuboid,
+    "cone":     make_cone,
+    "cylinder": make_cylinder,
+}
+
+SHAPE_CYCLE = ["sphere", "cuboid", "cone", "cylinder"]
+
+
+# ----------------------------------------------------------
+# Shape Parameter Presets
+# Each shape has named parameters with default, min, max, step
+# ----------------------------------------------------------
+SHAPE_PARAMS = {
+    "sphere": {
+        "radius":    {"val": 80,  "min": 20,  "max": 200, "step": 10},
+    },
+    "cuboid": {
+        "width":     {"val": 120, "min": 20,  "max": 300, "step": 10},
+        "height":    {"val": 100, "min": 20,  "max": 300, "step": 10},
+        "depth":     {"val": 80,  "min": 20,  "max": 300, "step": 10},
+    },
+    "cone": {
+        "radius":    {"val": 70,  "min": 20,  "max": 200, "step": 10},
+        "height":    {"val": 140, "min": 30,  "max": 300, "step": 10},
+    },
+    "cylinder": {
+        "radius":    {"val": 60,  "min": 20,  "max": 200, "step": 10},
+        "height":    {"val": 120, "min": 30,  "max": 300, "step": 10},
+    },
+}
+
+
+# ----------------------------------------------------------
+# Scene Object — one placed 3D shape
+# ----------------------------------------------------------
+class SceneObject:
+    def __init__(self, shape_type, params, color, scene_x=0, scene_y=0):
+        self.shape_type = shape_type
+        self.params     = dict(params)       # snapshot of params at placement
+        self.color      = color
+        self.scene_x    = scene_x            # Position offset in scene space
+        self.scene_y    = scene_y
+        self.selected   = False
+
+        # Build mesh
+        self.verts, self.edges = self._build_mesh()
+
+    def _build_mesh(self):
+        """Generate mesh vertices + edges from current params."""
+        gen = SHAPE_GENERATORS[self.shape_type]
+        p   = self.params
+
+        if self.shape_type == "sphere":
+            return gen(radius=p["radius"])
+        elif self.shape_type == "cuboid":
+            return gen(w=p["width"], h=p["height"], d=p["depth"])
+        elif self.shape_type == "cone":
+            return gen(radius=p["radius"], height=p["height"])
+        elif self.shape_type == "cylinder":
+            return gen(radius=p["radius"], height=p["height"])
+        return gen()
+
+    def rebuild(self):
+        """Rebuild mesh after params change."""
+        self.verts, self.edges = self._build_mesh()
+
+
+# ----------------------------------------------------------
+# Primitives3DEngine — main class used by main.py
+# ----------------------------------------------------------
+class Primitives3DEngine:
+    def __init__(self, width, height):
+        self.width  = width
+        self.height = height
+        self.cx     = width  // 2
+        self.cy     = height // 2
+        self.focal  = width
+
+        # Current shape being configured (before placement)
+        self.current_shape  = "sphere"
+        self.current_params = {k: dict(v) for k, v in SHAPE_PARAMS["sphere"].items()}
+        self.active_param   = "radius"   # which param the +/- keys control
+
+        # Scene: list of placed SceneObject instances
+        self.scene          = []
+        self.selected_idx   = None   # index into self.scene, or None
+
+        # Global rotation (applies to all objects)
+        self.rot_x          = 0.15
+        self.rot_y          = 0.0
+        self.auto_rot_y     = 0.008
+        self.auto_rot_x     = 0.002
+
+        # Color palette
+        self._palette = [
+            (0,   255, 255),
+            (255, 100, 50 ),
+            (100, 255, 100),
+            (255, 80,  200),
+            (80,  160, 255),
+            (255, 220, 60 ),
+        ]
+        self._color_idx = 0
+
+        print(f"[Primitives3D] Ready. Shape: {self.current_shape}")
+
+    # ----------------------------------------------------------
+    # SHAPE TYPE CONTROL
+    # ----------------------------------------------------------
+    def cycle_shape(self):
+        """Cycle to the next shape type."""
+        idx = SHAPE_CYCLE.index(self.current_shape)
+        self.current_shape  = SHAPE_CYCLE[(idx + 1) % len(SHAPE_CYCLE)]
+        self.current_params = {
+            k: dict(v) for k, v in SHAPE_PARAMS[self.current_shape].items()
+        }
+        # Set active_param to first param of new shape
+        self.active_param = list(self.current_params.keys())[0]
+        print(f"[Primitives3D] Shape: {self.current_shape.upper()}")
+        return self.current_shape
+
+    def cycle_active_param(self):
+        """Cycle which parameter the +/- keys control."""
+        keys = list(self.current_params.keys())
+        idx  = keys.index(self.active_param) if self.active_param in keys else 0
+        self.active_param = keys[(idx + 1) % len(keys)]
+        val = self.current_params[self.active_param]["val"]
+        print(f"[Primitives3D] Active param: {self.active_param} = {val}")
+
+    def param_increase(self):
+        """Increase the active parameter value."""
+        p = self.current_params[self.active_param]
+        p["val"] = min(p["max"], p["val"] + p["step"])
+        print(f"[Primitives3D] {self.active_param} = {p['val']}")
+
+    def param_decrease(self):
+        """Decrease the active parameter value."""
+        p = self.current_params[self.active_param]
+        p["val"] = max(p["min"], p["val"] - p["step"])
+        print(f"[Primitives3D] {self.active_param} = {p['val']}")
+
+    # ----------------------------------------------------------
+    # SCENE CONTROL
+    # ----------------------------------------------------------
+    def place_shape(self, offset_x=0, offset_y=0):
+        """
+        Add current shape with current params to the scene.
+        offset_x/y: position relative to scene center (in 3D units).
+        """
+        color = self._palette[self._color_idx % len(self._palette)]
+        self._color_idx += 1
+
+        obj = SceneObject(
+            shape_type=self.current_shape,
+            params={k: v["val"] for k, v in self.current_params.items()},
+            color=color,
+            scene_x=offset_x,
+            scene_y=offset_y,
+        )
+        self.scene.append(obj)
+        self.selected_idx = len(self.scene) - 1
+        print(f"[Primitives3D] Placed {self.current_shape} "
+              f"({len(self.scene)} objects in scene)")
+
+    def delete_selected(self):
+        """Delete the currently selected shape."""
+        if self.selected_idx is not None and self.scene:
+            name = self.scene[self.selected_idx].shape_type
+            self.scene.pop(self.selected_idx)
+            self.selected_idx = len(self.scene) - 1 if self.scene else None
+            print(f"[Primitives3D] Deleted {name}. "
+                  f"{len(self.scene)} objects remain.")
+
+    def select_next(self):
+        """Cycle selection to next object."""
+        if not self.scene:
+            return
+        if self.selected_idx is None:
+            self.selected_idx = 0
+        else:
+            self.selected_idx = (self.selected_idx + 1) % len(self.scene)
+        print(f"[Primitives3D] Selected: {self.scene[self.selected_idx].shape_type}")
+
+    def clear_scene(self):
+        """Remove all objects."""
+        self.scene        = []
+        self.selected_idx = None
+        print("[Primitives3D] Scene cleared.")
+
+    # ----------------------------------------------------------
+    # ROTATION
+    # ----------------------------------------------------------
+    def _rot_x_mat(self, a):
+        c, s = math.cos(a), math.sin(a)
+        return np.array([[1,0,0],[0,c,-s],[0,s,c]], dtype=np.float32)
+
+    def _rot_y_mat(self, a):
+        c, s = math.cos(a), math.sin(a)
+        return np.array([[c,0,s],[0,1,0],[-s,0,c]], dtype=np.float32)
+
+    def _project(self, x, y, z):
+        denom = self.focal + z
+        if abs(denom) < 1e-6:
+            denom = 1e-6
+        sx = int(self.focal * x / denom + self.cx)
+        sy = int(self.focal * y / denom + self.cy)
+        return sx, sy
+
+    def reset_rotation(self):
+        self.rot_x = 0.15
+        self.rot_y = 0.0
+
+    # ----------------------------------------------------------
+    # MAIN UPDATE + RENDER
+    # ----------------------------------------------------------
+    def update(self, frame, landmarks=None, auto_rotate=True):
+        """
+        Rotate all objects and render them onto frame.
+        If landmarks provided, wrist tilt drives rotation.
+        """
+        # Update rotation
+        if landmarks is not None:
+            wrist  = landmarks[0]
+            middle = landmarks[9]
+            dx     = (middle[0] - wrist[0]) / (self.width  * 0.5)
+            dy     = (middle[1] - wrist[1]) / (self.height * 0.5)
+            self.rot_y += dx * 0.03
+            self.rot_x += dy * 0.03
+        elif auto_rotate:
+            self.rot_x += self.auto_rot_x
+            self.rot_y += self.auto_rot_y
+
+        self.rot_x %= (2 * math.pi)
+        self.rot_y %= (2 * math.pi)
+
+        Rx = self._rot_x_mat(self.rot_x)
+        Ry = self._rot_y_mat(self.rot_y)
+        R  = Ry @ Rx
+
+        # Render each scene object
+        for obj_idx, obj in enumerate(self.scene):
+            is_selected = (obj_idx == self.selected_idx)
+            self._render_object(frame, obj, R, is_selected)
+
+        return frame
+
+    def _render_object(self, frame, obj, R, is_selected):
+        """Project and draw one SceneObject."""
+        projected = []
+        depths    = []
+
+        for (x, y, z) in obj.verts:
+            # Apply scene position offset
+            x += obj.scene_x
+            y += obj.scene_y
+
+            # Rotate
+            pt  = np.array([x, y, z], dtype=np.float32)
+            pr  = R @ pt
+            rx, ry, rz = pr
+
+            sx, sy = self._project(rx, ry, rz)
+            projected.append((sx, sy))
+            depths.append(rz)
+
+        if not projected:
+            return
+
+        # Depth-based fading
+        avg_depth  = sum(depths) / len(depths)
+        depth_norm = max(0.0, min(1.0, (avg_depth + 200) / 400))
+        fade       = 1.0 - depth_norm * 0.55
+
+        # Selected objects: brighter + thicker
+        thickness  = 3 if is_selected else 1
+        color      = obj.color
+        if is_selected:
+            # Boost brightness for selected
+            color = tuple(min(255, int(c * 1.3 + 40)) for c in color)
+        else:
+            color = tuple(int(c * fade) for c in color)
+
+        h, w = frame.shape[:2]
+
+        # Draw edges
+        for (i, j) in obj.edges:
+            if i >= len(projected) or j >= len(projected):
+                continue
+            p1 = projected[i]
+            p2 = projected[j]
+            if (0 <= p1[0] < w and 0 <= p1[1] < h and
+                0 <= p2[0] < w and 0 <= p2[1] < h):
+                cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
+
+        # Draw vertices
+        for (sx, sy) in projected:
+            if 0 <= sx < w and 0 <= sy < h:
+                cv2.circle(frame, (sx, sy), 2, color, -1)
+
+        # Label for selected object
+        if is_selected and projected:
+            # Find topmost projected point for label placement
+            top_pt = min(projected, key=lambda p: p[1])
+            label  = f"[{obj.shape_type}]"
+            cv2.putText(frame, label,
+                        (top_pt[0] - 20, max(15, top_pt[1] - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        color, 1, cv2.LINE_AA)
+
+    # ----------------------------------------------------------
+    # SAVE SCENE
+    # ----------------------------------------------------------
+    def save_scene(self, frame):
+        """Save current rendered frame as PNG."""
+        save_dir = os.path.join("data", "drawings")
+        os.makedirs(save_dir, exist_ok=True)
+        ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname    = os.path.join(save_dir, f"scene_3d_{ts}.png")
+        cv2.imwrite(fname, frame)
+        print(f"[Primitives3D] Scene saved: {fname}")
+        return fname
+
+    # ----------------------------------------------------------
+    # HUD
+    # ----------------------------------------------------------
+    def draw_hud(self, frame):
+        """
+        Draw a parameter panel on the right side of the frame.
+        Shows: current shape, all params, active param highlighted,
+               scene object count.
+        """
+        from utils.overlay_utils import draw_text_with_bg
+
+        panel_x = frame.shape[1] - 240
+        y       = 50
+
+        # Panel background
+        cv2.rectangle(frame,
+                      (panel_x - 8, y - 20),
+                      (frame.shape[1] - 5, y + 160),
+                      (0, 0, 0), -1)
+        cv2.rectangle(frame,
+                      (panel_x - 8, y - 20),
+                      (frame.shape[1] - 5, y + 160),
+                      (0, 200, 200), 1)
+
+        # Shape name
+        cv2.putText(frame,
+                    f"Shape: {self.current_shape.upper()}",
+                    (panel_x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 255, 255), 1, cv2.LINE_AA)
+        y += 22
+
+        # Parameters
+        for pname, pdata in self.current_params.items():
+            is_active = (pname == self.active_param)
+            color     = (0, 255, 100) if is_active else (160, 160, 160)
+            prefix    = "► " if is_active else "  "
+            cv2.putText(frame,
+                        f"{prefix}{pname}: {pdata['val']}",
+                        (panel_x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        color, 1, cv2.LINE_AA)
+            y += 20
+
+        y += 5
+        # Controls reminder
+        for hint in ["[n] next shape", "[p] next param",
+                     "[+/-] adjust", "[Enter] place",
+                     "[Del] delete sel", "[Tab] sel next"]:
+            cv2.putText(frame, hint, (panel_x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        (120, 120, 120), 1, cv2.LINE_AA)
+            y += 16
+
+        # Scene count
+        count_color = (0, 200, 255) if self.scene else (100, 100, 100)
+        cv2.putText(frame,
+                    f"Scene: {len(self.scene)} object(s)",
+                    (panel_x, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    count_color, 1, cv2.LINE_AA)
+
+        return frame

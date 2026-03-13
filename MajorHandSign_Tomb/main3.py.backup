@@ -1,0 +1,215 @@
+# =============================================================
+# main.py  —  Phase 3
+#
+# Added in this phase:
+#   - DrawingCanvas : air drawing + eraser overlay
+#
+# Gesture → action mapping so far:
+#   draw          → draw on canvas with index fingertip
+#   erase         → erase canvas content near fingertip
+#   click         → mouse click
+#   drag          → mouse drag
+#   select_start  → begin selection area
+#   select_end    → end selection area
+#   filter_next   → cycle to next filter
+#
+# Keyboard shortcuts:
+#   f → cycle filters
+#   l → toggle landmarks
+#   m → toggle mouse control
+#   c → clear canvas
+#   s → save drawing
+#   q → quit
+# =============================================================
+# =============================================================
+# main.py  —  Phase 3 (updated)
+#
+# Changes in this update:
+#   - Uses ShapeCanvas instead of DrawingCanvas
+#   - Open palm swipe left/right → prev/next filter
+#   - Thumb+middle select now does real OS drag selection
+#   - Thumb+pinky pinch cycles shape mode
+#   - Shape mode shows live preview, commits on gesture end
+# =============================================================
+
+# =============================================================
+# main.py  —  Phase 4
+#
+# Added in this phase:
+#   - AR3DEngine : extrudes drawn strokes into a rotating 3D object
+#
+# New keyboard shortcut:
+#   t → build 3D object from current drawing + toggle 3D mode
+#   r → reset / clear 3D object
+#
+# Workflow:
+#   1. Draw something with your finger (index only = draw gesture)
+#   2. Press 't' — your drawing is extruded into a 3D object
+#   3. The object auto-rotates slowly
+#   4. Use drag gesture (index+middle) while 3D mode is active
+#      to manually rotate the object with your hand
+#   5. Press 't' again to toggle 3D off (drawing stays on canvas)
+#   6. Press 'r' to clear the 3D object entirely
+# =============================================================
+
+import cv2
+import config
+
+from modules.camera           import Camera
+from modules.filters          import FilterEngine
+from modules.hand_tracker     import HandTracker
+from modules.gesture_engine   import GestureEngine
+from modules.mouse_controller import MouseController
+from modules.drawing_canvas   import ShapeCanvas
+from modules.ar_3d            import AR3DEngine
+from utils.fps_counter        import FPSCounter
+
+
+def main():
+    # ----------------------------------------------------------
+    # SETUP
+    # ----------------------------------------------------------
+    cam = Camera()
+    cam.open()
+
+    filters    = FilterEngine()
+    fps        = FPSCounter()
+    tracker    = HandTracker()
+    engine     = GestureEngine()
+    controller = MouseController()
+    canvas     = ShapeCanvas(config.FRAME_WIDTH, config.FRAME_HEIGHT)
+    ar3d       = AR3DEngine(config.FRAME_WIDTH, config.FRAME_HEIGHT)
+
+    print(f"\n{'='*55}")
+    print(" AR Studio — Phase 4")
+    print(f"{'='*55}")
+    print(" GESTURES:")
+    print("   Index only         → draw / move cursor")
+    print("   Closed fist        → erase")
+    print("   Thumb + Index      → mouse click")
+    print("   Index + Middle     → drag (also rotates 3D object in 3D mode)")
+    print("   Thumb + Middle     → select area start / end")
+    print("   Thumb + Pinky      → cycle shape mode")
+    print("   Open palm swipe    → prev/next filter")
+    print("")
+    print(" KEYS:")
+    print("   t → build 3D from drawing + toggle 3D mode")
+    print("   r → clear 3D object")
+    print("   f → filter  |  l → landmarks  |  m → mouse")
+    print("   c → clear canvas  |  s → save  |  q → quit")
+    print(f"{'='*55}\n")
+
+    # ----------------------------------------------------------
+    # MAIN LOOP
+    # ----------------------------------------------------------
+    while True:
+
+        # 1. CAPTURE
+        frame = cam.read()
+        if frame is None:
+            break
+
+        # 2. HAND TRACKING
+        landmarks = tracker.update(frame)
+
+        # 3. GESTURE
+        gesture = engine.update(landmarks)
+
+        # 4. FILTER SWIPE
+        if gesture == "filter_next":
+            filters.cycle()
+        elif gesture == "filter_prev":
+            filters.prev()
+
+        # 5. MOUSE CONTROL
+        #    When 3D mode is active, drag gesture rotates object
+        #    instead of dragging the OS cursor
+        mouse_gesture = gesture
+        if ar3d.active and gesture == "drag":
+            mouse_gesture = "idle"   # Don't move OS cursor while rotating 3D
+
+        if gesture not in ("draw", "erase"):
+            controller.update(landmarks, mouse_gesture, engine)
+
+        # 6. APPLY FILTER
+        frame = filters.apply(frame)
+
+        # 7. DRAWING CANVAS
+        #    Suppress canvas drawing while 3D mode is active
+        #    (so you don't accidentally add strokes on top of 3D)
+        if not ar3d.active:
+            frame = canvas.update(frame, landmarks, gesture,
+                                  shape_mode=engine.shape_mode)
+        else:
+            # Still blend existing canvas (but don't accept new strokes)
+            frame = canvas.update(frame, landmarks, "idle",
+                                  shape_mode=engine.shape_mode)
+
+        # 8. 3D AR LAYER
+        #    Renders the extruded 3D object on top of the canvas
+        frame = ar3d.update(frame, landmarks, gesture)
+
+        # 9. OVERLAYS
+        tracker.draw(frame)
+        engine.draw_hud(frame)
+        canvas.draw_hud(frame, gesture if not ar3d.active else "idle")
+        ar3d.draw_hud(frame)
+
+        if gesture not in ("draw", "erase"):
+            controller.draw_hud(frame, landmarks)
+
+        # 10. HUD
+        if config.SHOW_FPS:
+            fps.update()
+            fps.draw(frame)
+        filters.draw_hud(frame)
+
+        # Phase 5 will add: face_recognition.update(frame)
+        # Phase 6 will add: symbol_detector.update(frame)
+
+        # 11. SHOW
+        cv2.imshow(config.WINDOW_NAME, frame)
+
+        # 12. KEYBOARD
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == config.KEY_QUIT:
+            break
+
+        elif key == ord('t'):
+            # If 3D is currently off → build from canvas and turn on
+            # If 3D is currently on → just toggle it off
+            if not ar3d.active:
+                ar3d.build_from_strokes(canvas.strokes)
+            else:
+                ar3d.toggle()
+
+        elif key == ord('r'):
+            ar3d.clear()
+
+        elif key == config.KEY_CYCLE_FILTER:
+            filters.cycle()
+
+        elif key == config.KEY_TOGGLE_LANDMARKS:
+            tracker.toggle_landmarks()
+
+        elif key == config.KEY_CLEAR_CANVAS:
+            canvas.clear()
+            ar3d.clear()   # Clear 3D too when canvas is wiped
+
+        elif key == config.KEY_SAVE_DRAWING:
+            canvas.save()
+
+        elif key == ord('m'):
+            controller.toggle()
+
+    # ----------------------------------------------------------
+    # CLEANUP
+    # ----------------------------------------------------------
+    cam.release()
+    cv2.destroyAllWindows()
+    print("[main] Shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()

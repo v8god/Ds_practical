@@ -1,0 +1,106 @@
+# =============================================================
+# main.py  —  Phase 1
+#
+# This is the entry point for the entire AR Studio.
+# main.py has ONE job: call modules in the right order each frame.
+# It contains NO logic of its own — all logic lives in modules.
+#
+# Phase 1 wires together:
+#   Camera → Filters → FPS display → Show window
+#
+# Each phase will ADD imports and calls here.
+# We never rewrite main.py — we only extend it.
+# =============================================================
+
+import cv2
+import config
+
+from modules.camera  import Camera
+from modules.filters import FilterEngine
+from modules.hand_tracker     import HandTracker
+from modules.gesture_engine   import GestureEngine
+from modules.mouse_controller import MouseController
+from utils.fps_counter  import FPSCounter
+from utils.overlay_utils import draw_text_with_bg
+
+
+def main():
+    # ----------------------------------------------------------
+    # SETUP — runs once before the loop
+    # ----------------------------------------------------------
+    cam    = Camera()
+    cam.open()                   # Opens webcam, prints actual resolution
+
+    filters = FilterEngine()     # Starts with config.DEFAULT_FILTER (none)
+    fps     = FPSCounter()       # Starts timing from first frame
+    tracker    = HandTracker()
+    engine     = GestureEngine()
+    controller = MouseController()
+
+    print(f"\n{'='*50}")
+    print(" AR Studio — Phase 1 Running")
+    print(f"{'='*50}")
+    print(" Controls:")
+    print("   f  — cycle through filters")
+    print("   l  — toggle landmark display (Phase 2+)")
+    print("   c  — clear canvas (Phase 3+)")
+    print("   s  — save drawing (Phase 3+)")
+    print("   q  — quit")
+    print(f"{'='*50}\n")
+
+    # ----------------------------------------------------------
+    # MAIN LOOP — runs every frame
+    # ----------------------------------------------------------
+    while True:
+
+        # 1. CAPTURE — get raw frame from webcam
+        frame = cam.read()
+        if frame is None:
+            print("[main] No frame received. Exiting.")
+            break
+
+        # 2. FILTER — apply active visual filter
+        frame = filters.apply(frame)
+
+        # 3. HUD — draw UI overlays on top of frame
+        if config.SHOW_FPS:
+            fps.update()
+            fps.draw(frame)
+
+        filters.draw_hud(frame)   # Shows current filter name top-right
+
+        # Phase 2 will add: hand_tracker.update(frame)
+        # Phase 2 will add: gesture_engine.update(landmarks)
+        # Phase 2 will add: mouse_controller.update(gesture, landmarks)
+        # Phase 3 will add: drawing_canvas.update(frame, landmarks, gesture)
+        # Phase 4 will add: ar_3d.update(frame, strokes)
+        # Phase 5 will add: face_recognition.update(frame)
+        # Phase 6 will add: symbol_detector.update(frame)
+
+        # 4. SHOW — display the final composed frame
+        cv2.imshow(config.WINDOW_NAME, frame)
+
+        # 5. KEYS — handle keyboard input
+        key = cv2.waitKey(1) & 0xFF   # waitKey(1) = wait 1ms, then continue
+
+        if key == config.KEY_QUIT:
+            print("[main] Quit key pressed.")
+            break
+
+        elif key == config.KEY_CYCLE_FILTER:
+            filters.cycle()
+
+        # Phase 2+ keys will be added here as we build them
+
+    # ----------------------------------------------------------
+    # CLEANUP — always runs on exit (even if error occurs)
+    # ----------------------------------------------------------
+    cam.release()
+    cv2.destroyAllWindows()
+    print("[main] Shutdown complete.")
+
+
+# Standard Python entry point guard
+# Prevents main() from running if this file is imported by another module
+if __name__ == "__main__":
+    main()

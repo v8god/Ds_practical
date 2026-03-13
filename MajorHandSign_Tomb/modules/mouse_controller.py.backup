@@ -1,0 +1,215 @@
+# =============================================================
+# modules/mouse_controller.py
+#
+# Maps hand landmark positions → actual OS mouse movements.
+#
+# WHAT THIS MODULE DOES:
+#   - Takes the index fingertip position from landmarks
+#   - Maps it from camera pixel coords → screen pixel coords
+#   - Moves the system cursor via PyAutoGUI
+#   - Handles click, drag based on gesture
+#   - Applies smoothing so the cursor doesn't jump
+#
+# WHY COORDINATE MAPPING IS NEEDED:
+#   Camera frame:  e.g. 1280 x 720 pixels
+#   Screen:        e.g. 1920 x 1080 pixels
+#   These are different sizes AND the usable tracking zone
+#   (after margins) is smaller than the full frame.
+#
+#   We map: camera_zone → screen_size using linear interpolation
+#   numpy.interp(value, [in_min, in_max], [out_min, out_max])
+#
+# MARGIN CONCEPT:
+#   Without margins, reaching the screen corners requires moving
+#   your finger to the very edge of the camera frame — almost
+#   off-screen for the camera. Margins shrink the input zone so
+#   "near-edge" finger positions still map to full screen edges.
+# =============================================================
+
+import numpy as np
+import pyautogui
+import config
+from utils.smoother import EMAsmoother
+
+
+# PyAutoGUI safety: disable the fail-safe (moving to screen corner exits)
+# We disable it because gesture control naturally moves to corners
+pyautogui.FAILSAFE = False
+
+# PyAutoGUI pause: default adds 0.1s sleep after every call — remove it
+pyautogui.PAUSE = 0.0
+
+
+class MouseController:
+    def __init__(self):
+        # Get screen dimensions once at startup
+        self.screen_w, self.screen_h = pyautogui.size()
+        print(f"[MouseController] Screen size: {self.screen_w}x{self.screen_h}")
+
+        # Camera frame size (from config)
+        self.frame_w = config.FRAME_WIDTH
+        self.frame_h = config.FRAME_HEIGHT
+
+        # Margins: trim this many pixels from each edge of the camera frame
+        # before mapping to screen. Makes corners reachable.
+        self.margin_x = config.MOUSE_MARGIN_X
+        self.margin_y = config.MOUSE_MARGIN_Y
+
+        # Smoothers for cursor x and y separately
+        # Using a slightly lower alpha than landmark smoothing for extra stability
+        self.x_smoother = EMAsmoother(alpha=0.4)
+        self.y_smoother = EMAsmoother(alpha=0.4)
+
+        # Internal state
+        self._dragging    = False
+        self._mouse_active = True   # Can be toggled to pause mouse control
+
+    def update(self, landmarks, gesture):
+        """
+        Move the cursor and perform mouse actions based on gesture.
+
+        Parameters:
+            landmarks : list of 21 (x,y) tuples or None
+            gesture   : str from GestureEngine (e.g. "click", "drag", "idle")
+
+        This method is SAFE to call even when landmarks is None —
+        it just does nothing.
+        """
+        if not self._mouse_active:
+            return
+
+        if landmarks is None:
+            # Hand left frame — release drag if we were dragging
+            if self._dragging:
+                pyautogui.mouseUp()
+                self._dragging = False
+            return
+
+        # Get index fingertip position (landmark 8)
+        finger_x, finger_y = landmarks[8]
+
+        # --------------------------------------------------
+        # MAP finger position → screen position
+        # --------------------------------------------------
+        # Input range: camera frame minus margins
+        in_x_min = self.margin_x
+        in_x_max = self.frame_w - self.margin_x
+        in_y_min = self.margin_y
+        in_y_max = self.frame_h - self.margin_y
+
+        # Map to full screen
+        raw_screen_x = np.interp(finger_x, [in_x_min, in_x_max], [0, self.screen_w])
+        raw_screen_y = np.interp(finger_y, [in_y_min, in_y_max], [0, self.screen_h])
+
+        # Smooth the screen coordinates
+        sx = self.x_smoother.update(raw_screen_x, raw_screen_y)[0]
+        sy = self.y_smoother.update(raw_screen_x, raw_screen_y)[1]
+
+        # Clamp to screen boundaries (in case of values slightly outside)
+        sx = max(0, min(self.screen_w - 1, int(sx)))
+        sy = max(0, min(self.screen_h - 1, int(sy)))
+
+        # --------------------------------------------------
+        # GESTURE → MOUSE ACTION
+        # --------------------------------------------------
+        if gesture == "click":
+            # Move to position then click
+            pyautogui.click(sx, sy)
+
+        elif gesture == "drag":
+            if not self._dragging:
+                # Start drag: press and hold mouse button
+                pyautogui.mouseDown(sx, sy)
+                self._dragging = True
+            else:
+                # Continue drag: move with button held
+                pyautogui.moveTo(sx, sy)
+
+        elif gesture in ("idle", "draw", "erase", "filter_next",
+                         "select_start", "select_end"):
+            # Release drag if we were dragging
+            if self._dragging:
+                pyautogui.mouseUp()
+                self._dragging = False
+
+            # Move cursor (no click)
+            pyautogui.moveTo(sx, sy)
+
+        elif gesture == "none":
+            if self._dragging:
+                pyautogui.mouseUp()
+                self._dragging = False
+            # Don't move cursor when no hand — cursor stays where it was
+
+    def toggle(self):
+        """Enable/disable mouse control without stopping other modules."""
+        self._mouse_active = not self._mouse_active
+        state = "ENABLED" if self._mouse_active else "DISABLED"
+        print(f"[MouseController] Mouse control: {state}")
+
+    def draw_hud(self, frame, landmarks):
+        """
+        Draws a dot at the mapped cursor position on the frame.
+        Shows where the cursor WILL go (in camera space).
+        Gives visual feedback so user can see the active control point.
+        """
+        if landmarks is None:
+            return frame
+
+        import cv2
+        finger_x, finger_y = landmarks[8]
+
+        # Draw a bright circle at index fingertip — the control point
+        cv2.circle(frame, (int(finger_x), int(finger_y)), 10,
+                   (0, 255, 0), 2)          # Green ring
+        cv2.circle(frame, (int(finger_x), int(finger_y)), 3,
+                   (0, 255, 0), -1)         # Green center dot
+
+        return frame
+
+
+# -------------------------------------------------------------
+# STANDALONE TEST
+#   python modules/mouse_controller.py
+#
+# WARNING: This test actually moves your real mouse cursor.
+# Move your hand to control the cursor. Pinch index+thumb to click.
+# Press 'q' to quit (you may need to use keyboard since cursor is controlled).
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    import sys, cv2
+    sys.path.insert(0, "..")
+
+    from modules.hand_tracker  import HandTracker
+    from modules.gesture_engine import GestureEngine
+
+    cap        = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    tracker    = HandTracker()
+    engine     = GestureEngine()
+    controller = MouseController()
+
+    print("Mouse controller test.")
+    print("Your hand controls the cursor.")
+    print("Pinch thumb+index to click.")
+    print("Press 'q' to quit.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        landmarks = tracker.update(frame)
+        gesture   = engine.update(landmarks)
+        controller.update(landmarks, gesture)
+
+        tracker.draw(frame)
+        engine.draw_hud(frame)
+        controller.draw_hud(frame, landmarks)
+
+        cv2.imshow("Mouse Controller Test", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()

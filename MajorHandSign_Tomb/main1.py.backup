@@ -1,0 +1,133 @@
+# =============================================================
+# main.py  —  Phase 2
+#
+# Added in this phase:
+#   - HandTracker   : detects hand + 21 landmarks each frame
+#   - GestureEngine : reads landmarks → gesture string
+#   - MouseController : gesture + landmarks → OS cursor moves
+#
+# New keyboard shortcuts:
+#   m — toggle mouse control on/off
+#   l — toggle landmark display on/off
+# =============================================================
+
+import cv2
+import config
+
+from modules.camera           import Camera
+from modules.filters          import FilterEngine
+from modules.hand_tracker     import HandTracker
+from modules.gesture_engine   import GestureEngine
+from modules.mouse_controller import MouseController
+from utils.fps_counter        import FPSCounter
+from utils.overlay_utils      import draw_text_with_bg
+
+
+def main():
+    # ----------------------------------------------------------
+    # SETUP
+    # ----------------------------------------------------------
+    cam        = Camera()
+    cam.open()
+
+    filters    = FilterEngine()
+    fps        = FPSCounter()
+    tracker    = HandTracker()
+    engine     = GestureEngine()
+    controller = MouseController()
+
+    print(f"\n{'='*50}")
+    print(" AR Studio — Phase 2 Running")
+    print(f"{'='*50}")
+    print(" Controls:")
+    print("   f  — cycle through filters")
+    print("   l  — toggle landmark display")
+    print("   m  — toggle mouse control on/off")
+    print("   c  — clear canvas (Phase 3+)")
+    print("   s  — save drawing (Phase 3+)")
+    print("   q  — quit")
+    print(f"\n Gesture Guide:")
+    print("   Index only up     → draw mode / cursor move")
+    print("   Thumb + Index     → click")
+    print("   Index + Middle    → drag")
+    print("   Thumb + Middle    → select start / end")
+    print("   Open palm         → cycle filter")
+    print("   Closed fist       → erase mode")
+    print(f"{'='*50}\n")
+
+    # ----------------------------------------------------------
+    # MAIN LOOP
+    # ----------------------------------------------------------
+    while True:
+
+        # 1. CAPTURE
+        frame = cam.read()
+        if frame is None:
+            print("[main] No frame received. Exiting.")
+            break
+
+        # 2. HAND TRACKING — run MediaPipe on this frame
+        #    Returns list of 21 (x,y) tuples, or None if no hand
+        landmarks = tracker.update(frame)
+
+        # 3. GESTURE DETECTION — interpret landmark positions
+        #    Returns a gesture string: "click", "draw", "drag", etc.
+        gesture = engine.update(landmarks)
+
+        # 4. MOUSE CONTROL — move OS cursor based on gesture
+        controller.update(landmarks, gesture)
+
+        # 5. GESTURE-TRIGGERED ACTIONS
+        #    Open palm → cycle to next filter (same as pressing 'f')
+        if gesture == "filter_next" and engine._prev_gesture != "filter_next":
+            filters.cycle()
+
+        # 6. FILTER — apply active visual filter to frame
+        frame = filters.apply(frame)
+
+        # 7. DRAW OVERLAYS (applied in order, bottom to top)
+        tracker.draw(frame)                        # Hand skeleton + landmark dots
+        engine.draw_hud(frame)                     # Current gesture name
+        controller.draw_hud(frame, landmarks)      # Cursor indicator dot
+
+        # 8. HUD
+        if config.SHOW_FPS:
+            fps.update()
+            fps.draw(frame)
+
+        filters.draw_hud(frame)
+
+        # Phase 3 will add: drawing_canvas.update(frame, landmarks, gesture)
+        # Phase 4 will add: ar_3d.update(frame, canvas.strokes)
+        # Phase 5 will add: face_recognition.update(frame)
+        # Phase 6 will add: symbol_detector.update(frame)
+
+        # 9. SHOW
+        cv2.imshow(config.WINDOW_NAME, frame)
+
+        # 10. KEYBOARD INPUT
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == config.KEY_QUIT:
+            print("[main] Quit key pressed.")
+            break
+
+        elif key == config.KEY_CYCLE_FILTER:
+            filters.cycle()
+
+        elif key == config.KEY_TOGGLE_LANDMARKS:
+            tracker.toggle_landmarks()
+
+        elif key == ord('m'):
+            controller.toggle()
+
+    # ----------------------------------------------------------
+    # CLEANUP
+    # ----------------------------------------------------------
+    cam.release()
+    cv2.destroyAllWindows()
+    print("[main] Shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,604 @@
+# =============================================================
+# modules/ar_3d.py
+#
+# Generates a pseudo-3D object from the strokes drawn on the
+# canvas and renders it as an AR overlay on the video frame.
+#
+# WHY "PSEUDO-3D" AND NOT REAL 3D:
+#   Real 3D requires a depth camera (like Intel RealSense) or
+#   stereo cameras. We only have a regular webcam.
+#   Instead we simulate depth using these techniques:
+#     1. Extrusion: take 2D stroke paths and push them "back"
+#        by an offset to create a shadow/depth copy
+#     2. Perspective projection: points further "back" appear
+#        slightly smaller and shifted (vanishing point illusion)
+#     3. Rotation: rotate the entire object around Y and X axes
+#        using a rotation matrix, then project back to 2D
+#     4. Depth shading: faces further from viewer are darker
+#
+# THE PIPELINE:
+#   strokes (2D pixel points)
+#     → center and normalize to 3D space
+#     → apply rotation matrix (spin the object)
+#     → project back to 2D screen coords
+#     → draw front face, back face, connecting edges
+#
+# CONTROLS (from main.py):
+#   3D mode is toggled with the 't' key
+#   When active, the last committed drawing is extruded into 3D
+#   Object auto-rotates slowly, or can be rotated by hand gesture
+# =============================================================
+
+import cv2
+import numpy as np
+import math
+import config
+
+
+class AR3DObject:
+    """
+    Represents one extruded 3D object built from 2D stroke points.
+    """
+
+    def __init__(self, strokes, frame_w, frame_h):
+        """
+        strokes  : list of strokes from ShapeCanvas.strokes
+                   each stroke = list of (x, y) pixel tuples
+        frame_w, frame_h : camera frame dimensions
+        """
+        self.frame_w = frame_w
+        self.frame_h = frame_h
+
+        # Flatten all stroke points into one list for the "front face"
+        self.points_2d = self._flatten_strokes(strokes)
+
+        if len(self.points_2d) < 2:
+            self.valid = False
+            return
+        self.valid = True
+
+        # Convert 2D pixel coords → centered 3D coords
+        # Center of frame = origin (0, 0, 0)
+        cx = frame_w / 2
+        cy = frame_h / 2
+        scale = 1.0   # Keep at 1:1 pixel scale for now
+
+        self.points_3d = np.array([
+            [(x - cx) * scale, (y - cy) * scale, 0.0]
+            for (x, y) in self.points_2d
+        ], dtype=np.float32)
+
+        # Extrusion depth — how far "back" the back face is pushed
+        self.extrude_depth = 60.0   # pixels equivalent
+
+        # Build back face points (same x,y but z = -extrude_depth)
+        self.back_3d = self.points_3d.copy()
+        self.back_3d[:, 2] = -self.extrude_depth
+
+        # Rotation angles (radians) — updated each frame for auto-spin
+        self.rot_x = 0.0
+        self.rot_y = 0.0
+        self.rot_z = 0.0
+
+        # Auto-rotation speeds (radians per frame)
+        self.spin_y = 0.012    # Slow Y-axis spin by default
+        self.spin_x = 0.004
+        self.auto_rotate = True
+
+        # Color settings
+        self.front_color = (0, 255, 255)    # Cyan
+        self.back_color  = (0, 140, 140)    # Darker cyan
+        self.edge_color  = (0, 200, 200)    # Mid cyan for connecting edges
+        self.thickness   = 2
+
+        # Focal length for perspective projection
+        # Higher = less perspective distortion (more orthographic)
+        # Lower  = more extreme perspective (fisheye-like)
+        self.focal = max(frame_w, frame_h) * 1.2
+
+        print(f"[AR3D] Object created: {len(self.points_3d)} points, "
+              f"extrude={self.extrude_depth}px")
+
+    # ----------------------------------------------------------
+    # FLATTEN STROKES → SAMPLED POINT LIST
+    # ----------------------------------------------------------
+    def _flatten_strokes(self, strokes):
+        """
+        Take all strokes and return a manageable list of points.
+        We subsample to max 80 points so rendering stays fast.
+        """
+        all_pts = []
+        for stroke in strokes:
+            all_pts.extend(stroke)
+
+        if len(all_pts) == 0:
+            return []
+
+        # Subsample evenly if too many points
+        max_pts = 80
+        if len(all_pts) > max_pts:
+            step = len(all_pts) // max_pts
+            all_pts = all_pts[::step]
+
+        return all_pts
+
+    # ----------------------------------------------------------
+    # ROTATION MATRIX (3x3)
+    # ----------------------------------------------------------
+    def _rotation_matrix(self, rx, ry, rz):
+        """
+        Build a combined XYZ rotation matrix.
+        Applied as: R = Rz @ Ry @ Rx  (order matters)
+        """
+        # Rotation around X axis
+        Rx = np.array([
+            [1,           0,            0],
+            [0,  math.cos(rx), -math.sin(rx)],
+            [0,  math.sin(rx),  math.cos(rx)],
+        ], dtype=np.float32)
+
+        # Rotation around Y axis
+        Ry = np.array([
+            [ math.cos(ry), 0, math.sin(ry)],
+            [0,             1,            0],
+            [-math.sin(ry), 0, math.cos(ry)],
+        ], dtype=np.float32)
+
+        # Rotation around Z axis
+        Rz = np.array([
+            [math.cos(rz), -math.sin(rz), 0],
+            [math.sin(rz),  math.cos(rz), 0],
+            [0,             0,            1],
+        ], dtype=np.float32)
+
+        return Rz @ Ry @ Rx
+
+    # ----------------------------------------------------------
+    # PERSPECTIVE PROJECTION: 3D → 2D
+    # ----------------------------------------------------------
+    def _project(self, points_3d, R):
+        """
+        Rotate points then apply perspective projection.
+
+        Steps:
+          1. Apply rotation matrix R to each 3D point
+          2. Translate so object center is at camera center
+          3. Perspective divide: x_2d = x * focal / (focal + z)
+             (points further back = smaller)
+          4. Shift back to frame coordinates
+
+        Returns: list of (x, y) integer pixel tuples
+        """
+        cx = self.frame_w / 2
+        cy = self.frame_h / 2
+
+        projected = []
+        for pt in points_3d:
+            # Rotate
+            rotated = R @ pt
+
+            x, y, z = rotated
+
+            # Perspective divide
+            # z is negative for points behind camera, positive for in front
+            # We add focal to denominator to avoid division issues
+            denom = self.focal / (self.focal + z + 1e-6)
+            px = x * denom + cx
+            py = y * denom + cy
+
+            projected.append((int(px), int(py)))
+
+        return projected
+
+    # ----------------------------------------------------------
+    # DEPTH SHADING
+    # ----------------------------------------------------------
+    def _depth_color(self, base_color, z, z_min, z_max):
+        """
+        Darker color for points with lower z (further back).
+        base_color: (B, G, R) tuple
+        """
+        if z_max == z_min:
+            return base_color
+        t = (z - z_min) / (z_max - z_min)  # 0.0 = back, 1.0 = front
+        t = max(0.3, t)   # Never fully black — minimum 30% brightness
+        return tuple(int(c * t) for c in base_color)
+
+    # ----------------------------------------------------------
+    # MAIN UPDATE + RENDER
+    # ----------------------------------------------------------
+    def update(self, frame):
+        """
+        Rotate and render the 3D object onto frame.
+        Call once per frame.
+        """
+        if not self.valid:
+            return frame
+
+        # Auto-rotate
+        if self.auto_rotate:
+            self.rot_y += self.spin_y
+            self.rot_x += self.spin_x
+
+        R = self._rotation_matrix(self.rot_x, self.rot_y, self.rot_z)
+
+        # Rotate all points
+        front_rotated = [R @ p for p in self.points_3d]
+        back_rotated  = [R @ p for p in self.back_3d]
+
+        # Get z ranges for depth shading
+        all_z = [p[2] for p in front_rotated + back_rotated]
+        z_min, z_max = min(all_z), max(all_z)
+
+        # Project to 2D
+        front_2d = self._project(self.points_3d, R)
+        back_2d  = self._project(self.back_3d,   R)
+
+        # -----------------------------------------------
+        # RENDER ORDER: back first, then edges, then front
+        # (painter's algorithm — back faces drawn under front)
+        # -----------------------------------------------
+
+        # 1. Back face strokes (darker)
+        for i in range(len(back_2d) - 1):
+            z_avg = (back_rotated[i][2] + back_rotated[i+1][2]) / 2
+            color = self._depth_color(self.back_color, z_avg, z_min, z_max)
+            self._safe_line(frame, back_2d[i], back_2d[i+1], color, self.thickness)
+
+        # 2. Connecting edges (front point → back point)
+        # Draw every Nth point to avoid clutter
+        step = max(1, len(front_2d) // 20)
+        for i in range(0, len(front_2d), step):
+            z_val = front_rotated[i][2]
+            color = self._depth_color(self.edge_color, z_val, z_min, z_max)
+            self._safe_line(frame, front_2d[i], back_2d[i], color, 1)
+
+        # 3. Front face strokes (brightest)
+        for i in range(len(front_2d) - 1):
+            z_avg = (front_rotated[i][2] + front_rotated[i+1][2]) / 2
+            color = self._depth_color(self.front_color, z_avg, z_min, z_max)
+            self._safe_line(frame, front_2d[i], front_2d[i+1], color, self.thickness)
+
+        # 4. Front face dots at key points
+        for i in range(0, len(front_2d), step):
+            cv2.circle(frame, front_2d[i], 2, self.front_color, -1)
+
+        return frame
+
+    def _safe_line(self, frame, p1, p2, color, thickness):
+        """Draw a line only if both points are within frame bounds."""
+        h, w = frame.shape[:2]
+        margin = 500   # Allow slightly off-screen (OpenCV clips automatically)
+        if (all(-margin < v < w + margin for v in [p1[0], p2[0]]) and
+                all(-margin < v < h + margin for v in [p1[1], p2[1]])):
+            cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
+
+    def set_rotation_speed(self, spin_y=0.012, spin_x=0.004):
+        self.spin_y = spin_y
+        self.spin_x = spin_x
+
+    def rotate_by(self, delta_x, delta_y):
+        """Manually rotate the object (called from gesture control)."""
+        self.rot_x += delta_x
+        self.rot_y += delta_y
+
+
+# =============================================================
+# AR3DEngine — manages the lifecycle of 3D objects
+# Used by main.py
+# =============================================================
+
+class AR3DEngine:
+    def __init__(self, frame_w, frame_h):
+        self.frame_w   = frame_w
+        self.frame_h   = frame_h
+        self.obj       = None      # Current 3D object (only one at a time)
+        self.active    = False     # Is 3D mode on?
+        self._prev_index_tip = None  # For gesture-based rotation
+
+    def build_from_strokes(self, strokes):
+        """
+        Create a 3D object from the current canvas strokes.
+        Called when user presses 't' or triggers build gesture.
+        """
+        if not strokes:
+            print("[AR3D] No strokes to build from. Draw something first.")
+            return
+
+        self.obj    = AR3DObject(strokes, self.frame_w, self.frame_h)
+        self.active = self.obj.valid
+        if self.active:
+            print("[AR3D] 3D object built and rendering.")
+
+    def update(self, frame, landmarks=None, gesture=None):
+        """
+        Render the 3D object onto frame each tick.
+        Also handles gesture-based manual rotation:
+          drag gesture while 3D mode active → rotate object
+        """
+        if not self.active or self.obj is None:
+            return frame
+
+        # Gesture-based rotation: drag gesture rotates the object
+        if gesture == "drag" and landmarks is not None:
+            index_tip = landmarks[8]
+            if self._prev_index_tip is not None:
+                dx = (index_tip[0] - self._prev_index_tip[0]) * 0.015
+                dy = (index_tip[1] - self._prev_index_tip[1]) * 0.015
+                self.obj.rotate_by(dy, dx)
+                self.obj.auto_rotate = False   # Disable auto-spin while user rotates
+            self._prev_index_tip = index_tip
+        else:
+            self._prev_index_tip = None
+            if gesture != "drag":
+                self.obj.auto_rotate = True    # Resume auto-spin when not dragging
+
+        frame = self.obj.update(frame)
+        return frame
+
+    def toggle(self):
+        """Toggle 3D rendering on/off."""
+        self.active = not self.active and (self.obj is not None)
+        print(f"[AR3D] 3D rendering: {'ON' if self.active else 'OFF'}")
+
+    def clear(self):
+        """Remove current 3D object."""
+        self.obj    = None
+        self.active = False
+        print("[AR3D] 3D object cleared.")
+
+    def draw_hud(self, frame):
+        """Show 3D mode status on screen."""
+        if not self.active:
+            return frame
+        from utils.overlay_utils import draw_text_with_bg
+        draw_text_with_bg(frame, "3D MODE ACTIVE",
+                          (self.frame_w - 210, 65),
+                          font_scale=0.6,
+                          text_color=(0, 255, 255),
+                          bg_color=(0, 0, 0))
+        draw_text_with_bg(frame, "drag = rotate | t = toggle",
+                          (self.frame_w - 270, 95),
+                          font_scale=0.48,
+                          text_color=(100, 200, 200),
+                          bg_color=(0, 0, 0))
+        return frame
+
+
+# -------------------------------------------------------------
+# STANDALONE TEST:  python modules/ar_3d.py
+#
+# Draws a demo shape and extrudes it into 3D.
+# Press 't' to toggle 3D on/off.
+# Press 'q' to quit.
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, "..")
+
+    frame_w, frame_h = 1280, 720
+    engine = AR3DEngine(frame_w, frame_h)
+
+    # Build a demo circle stroke
+    demo_strokes = []
+    pts = []
+    cx, cy, r = frame_w // 2, frame_h // 2, 150
+    for i in range(60):
+        angle = 2 * math.pi * i / 60
+        pts.append((int(cx + r * math.cos(angle)),
+                    int(cy + r * math.sin(angle))))
+    demo_strokes.append(pts)
+
+    # Add a cross through the center
+    demo_strokes.append([(cx - 100, cy), (cx + 100, cy)])
+    demo_strokes.append([(cx, cy - 100), (cx, cy + 100)])
+
+    engine.build_from_strokes(demo_strokes)
+
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    print("AR 3D test. 't' = toggle 3D | 'q' = quit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.flip(frame, 1)
+        frame = cv2.resize(frame, (frame_w, frame_h))
+        frame = engine.update(frame)
+        engine.draw_hud(frame)
+
+        cv2.imshow("AR 3D Test", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('t'):
+            engine.toggle()
+
+    cap.release()
+    cv2.destroyAllWindows()# =============================================================
+# modules/ar_3d.py  — clean rewrite
+#
+# Converts 2D canvas strokes into a pseudo-3D rotating object.
+#
+# WHAT'S FIXED:
+#   - reset_rotation() method now exists
+#   - increase_depth() / decrease_depth() now exist
+#   - Auto-spin when no hand, wrist-tilt when hand present
+#   - Object stays on screen permanently until cleared
+# =============================================================
+
+import cv2
+import numpy as np
+import math
+import config
+
+
+class AR3DEngine:
+    def __init__(self, width, height):
+        self.width  = width
+        self.height = height
+        self.cx     = width  // 2
+        self.cy     = height // 2
+        self.focal  = width
+
+        self.rot_x  = 0.15
+        self.rot_y  = 0.0
+
+        self.auto_rot_y = 0.008
+        self.auto_rot_x = 0.003
+
+        self._obj_points = []   # list of strokes, each stroke = list of (x,y,z)
+        self._obj_colors = []   # color per stroke
+        self._obj_active = False
+
+        self._z_spread     = 30.0
+        self._z_spread_max = 200.0
+        self._z_spread_min = 5.0
+
+        self._palette = [
+            (0,   255, 255),
+            (255, 100, 0  ),
+            (100, 255, 100),
+            (255, 50,  200),
+            (50,  150, 255),
+            (255, 220, 50 ),
+        ]
+
+        print(f"[AR3D] Initialized {width}x{height}")
+
+    # ----------------------------------------------------------
+    def build_from_strokes(self, strokes_2d):
+        if not strokes_2d:
+            print("[AR3D] No strokes to build from.")
+            return
+
+        self._obj_points = []
+        self._obj_colors = []
+
+        all_pts = [pt for stroke in strokes_2d for pt in stroke]
+        if not all_pts:
+            return
+
+        cx = sum(p[0] for p in all_pts) / len(all_pts)
+        cy = sum(p[1] for p in all_pts) / len(all_pts)
+
+        num_strokes = len(strokes_2d)
+
+        for i, stroke in enumerate(strokes_2d):
+            if len(stroke) < 2:
+                continue
+            z_range = self._z_spread * max(1, num_strokes - 1)
+            z       = -z_range / 2 + i * self._z_spread
+
+            stroke_3d = [(px - cx, py - cy, z) for (px, py) in stroke]
+            self._obj_points.append(stroke_3d)
+            self._obj_colors.append(self._palette[i % len(self._palette)])
+
+        self._obj_active = True
+        self.rot_x = 0.15
+        self.rot_y = 0.0
+        print(f"[AR3D] Built from {len(self._obj_points)} strokes.")
+
+    # ----------------------------------------------------------
+    def _Rx(self, a):
+        c, s = math.cos(a), math.sin(a)
+        return np.array([[1,0,0],[0,c,-s],[0,s,c]], dtype=np.float32)
+
+    def _Ry(self, a):
+        c, s = math.cos(a), math.sin(a)
+        return np.array([[c,0,s],[0,1,0],[-s,0,c]], dtype=np.float32)
+
+    def _project(self, x, y, z):
+        d = self.focal + z
+        if abs(d) < 1e-6:
+            d = 1e-6
+        return int(self.focal * x / d + self.cx), \
+               int(self.focal * y / d + self.cy)
+
+    # ----------------------------------------------------------
+    def update(self, frame, landmarks=None):
+        if not self._obj_active:
+            return frame
+
+        # Rotation
+        if landmarks is not None:
+            wrist  = landmarks[0]
+            mid    = landmarks[9]
+            dx     = (mid[0] - wrist[0]) / (self.width  * 0.5)
+            dy     = (mid[1] - wrist[1]) / (self.height * 0.5)
+            self.rot_y += dx * 0.03
+            self.rot_x += dy * 0.03
+        else:
+            self.rot_x += self.auto_rot_x
+            self.rot_y += self.auto_rot_y
+
+        self.rot_x %= (2 * math.pi)
+        self.rot_y %= (2 * math.pi)
+
+        R = self._Ry(self.rot_y) @ self._Rx(self.rot_x)
+
+        for si, stroke_3d in enumerate(self._obj_points):
+            color = self._obj_colors[si]
+            projected, depths = [], []
+
+            for (x, y, z) in stroke_3d:
+                pr = R @ np.array([x, y, z], dtype=np.float32)
+                sx, sy = self._project(*pr)
+                projected.append((sx, sy))
+                depths.append(pr[2])
+
+            if len(projected) < 2:
+                continue
+
+            avg_d      = sum(depths) / len(depths)
+            depth_norm = max(0.0, min(1.0, (avg_d + 150) / 300))
+            fade       = 1.0 - depth_norm * 0.6
+            thickness  = max(1, int(2 * (1.0 - depth_norm * 0.5)))
+            col        = tuple(int(c * fade) for c in color)
+
+            for i in range(len(projected) - 1):
+                p1, p2 = projected[i], projected[i+1]
+                if (0<=p1[0]<self.width and 0<=p1[1]<self.height and
+                    0<=p2[0]<self.width and 0<=p2[1]<self.height):
+                    cv2.line(frame, p1, p2, col, thickness, cv2.LINE_AA)
+
+            for (sx, sy) in projected:
+                if 0<=sx<self.width and 0<=sy<self.height:
+                    cv2.circle(frame, (sx,sy), max(1,int(3*(1-depth_norm*0.4))), col, -1)
+
+        return frame
+
+    # ----------------------------------------------------------
+    def reset_rotation(self):
+        self.rot_x = 0.15
+        self.rot_y = 0.0
+        print("[AR3D] Rotation reset.")
+
+    def increase_depth(self):
+        self._z_spread = min(self._z_spread_max, self._z_spread + 10)
+        print(f"[AR3D] Z spread: {self._z_spread:.0f}")
+
+    def decrease_depth(self):
+        self._z_spread = max(self._z_spread_min, self._z_spread - 10)
+        print(f"[AR3D] Z spread: {self._z_spread:.0f}")
+
+    def clear(self):
+        self._obj_points = []
+        self._obj_colors = []
+        self._obj_active = False
+        print("[AR3D] Cleared.")
+
+    @property
+    def is_active(self):
+        return self._obj_active
+
+    def draw_hud(self, frame):
+        from utils.overlay_utils import draw_text_with_bg
+        if self._obj_active:
+            draw_text_with_bg(frame,
+                "3D STROKE  r=reset  z/x=depth",
+                (10, frame.shape[0] - 30),
+                font_scale=0.5,
+                text_color=(0, 255, 255),
+                bg_color=(0, 0, 0))
+        return frame

@@ -1,0 +1,191 @@
+# =============================================================
+# modules/ar_overlay.py
+#
+# Composites all AR layers onto the final frame.
+# Acts as the rendering coordinator for Phase 4+.
+#
+# WHAT THIS MODULE DOES:
+#   - Manages the "AR mode" state machine:
+#       normal → draw mode → convert to 3D → view 3D → clear
+#   - Triggers 3D conversion when user requests it (gesture or key)
+#   - Handles background glow effect behind 3D objects
+#   - Will be extended in Phase 5/6 for face animations and
+#     symbol-triggered effects
+#
+# STATE MACHINE:
+#   "canvas"  → user is drawing on 2D canvas (default)
+#   "3d"      → 3D object is displayed, canvas is hidden
+#   "both"    → both canvas and 3D visible (transition)
+#
+# HOW TO TRIGGER 3D CONVERSION:
+#   Press 't' key → converts current canvas strokes to 3D object
+#   The 2D canvas is NOT cleared — press 'c' separately if you want
+# =============================================================
+# =============================================================
+# modules/ar_overlay.py
+#
+# Composites all AR layers onto the final frame.
+# Acts as the rendering coordinator for Phase 4+.
+#
+# WHAT THIS MODULE DOES:
+#   - Manages the "AR mode" state machine:
+#       normal → draw mode → convert to 3D → view 3D → clear
+#   - Triggers 3D conversion when user requests it (gesture or key)
+#   - Handles background glow effect behind 3D objects
+#   - Will be extended in Phase 5/6 for face animations and
+#     symbol-triggered effects
+#
+# STATE MACHINE:
+#   "canvas"  → user is drawing on 2D canvas (default)
+#   "3d"      → 3D object is displayed, canvas is hidden
+#   "both"    → both canvas and 3D visible (transition)
+#
+# HOW TO TRIGGER 3D CONVERSION:
+#   Press 't' key → converts current canvas strokes to 3D object
+#   The 2D canvas is NOT cleared — press 'c' separately if you want
+# =============================================================
+
+import cv2
+import numpy as np
+import config
+
+
+class AROverlay:
+    def __init__(self, width, height, ar3d_engine):
+        self.width    = width
+        self.height   = height
+        self.ar3d     = ar3d_engine
+
+        # AR mode state
+        self.mode     = "canvas"   # "canvas" | "3d" | "both"
+
+        # Background glow when 3D is active
+        self._glow_alpha = 0.0
+        self._glow_target = 0.0
+
+        # Transition animation counter
+        self._transition_frames = 0
+
+    # ----------------------------------------------------------
+    def convert_to_3d(self, strokes):
+        """
+        Called when user presses 't'.
+        Takes current canvas strokes and builds 3D object.
+        """
+        if not strokes:
+            print("[AROverlay] No strokes to convert — draw something first.")
+            return False
+
+        self.ar3d.build_from_strokes(strokes)
+        self.mode            = "3d"
+        self._glow_target    = 0.3
+        self._transition_frames = 15   # Short flash effect on conversion
+        print("[AROverlay] Converted to 3D mode.")
+        return True
+
+    def back_to_canvas(self):
+        """Return to 2D canvas mode."""
+        self.mode         = "canvas"
+        self._glow_target = 0.0
+        print("[AROverlay] Back to canvas mode.")
+
+    def toggle_mode(self, strokes):
+        """Toggle between canvas and 3D mode."""
+        if self.mode == "canvas":
+            self.convert_to_3d(strokes)
+        else:
+            self.back_to_canvas()
+
+    # ----------------------------------------------------------
+    def update(self, frame, landmarks=None, gesture=None):
+        """
+        Apply all AR overlay effects onto frame.
+
+        In "canvas" mode: does nothing (canvas handled by ShapeCanvas).
+        In "3d" mode: renders 3D object + glow background.
+        In "both" mode: both (for transitions).
+
+        Returns modified frame.
+        """
+        # Animate glow alpha
+        self._glow_alpha += (self._glow_target - self._glow_alpha) * 0.1
+
+        if self.mode == "3d" or self.mode == "both":
+            # Background glow effect
+            if self._glow_alpha > 0.01:
+                frame = self._apply_glow(frame)
+
+            # Transition flash
+            if self._transition_frames > 0:
+                frame = self._apply_flash(frame)
+                self._transition_frames -= 1
+
+            # Render 3D object
+            frame = self.ar3d.update(frame, landmarks, gesture)
+
+            # HUD
+            self.ar3d.draw_hud(frame)
+
+        elif self.mode == "canvas":
+            # Still tick the 3D engine so rotation stays ready
+            # but don't render it
+            pass
+
+        return frame
+
+    # ----------------------------------------------------------
+    # VISUAL EFFECTS
+    # ----------------------------------------------------------
+    def _apply_glow(self, frame):
+        """
+        Adds a subtle dark vignette + color tint when 3D is active.
+        Makes the 3D object feel like it's floating in its own space.
+        """
+        glow_overlay = np.zeros_like(frame, dtype=np.uint8)
+
+        # Radial darkening at edges (vignette)
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        Y, X = np.ogrid[:h, :w]
+        dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
+        max_dist = np.sqrt(cx**2 + cy**2)
+        vignette = (dist / max_dist * 80 * self._glow_alpha).astype(np.uint8)
+        vignette_bgr = cv2.cvtColor(vignette, cv2.COLOR_GRAY2BGR)
+
+        frame = cv2.subtract(frame, vignette_bgr)
+
+        # Slight cyan tint in center
+        tint = np.zeros_like(frame, dtype=np.uint8)
+        tint[:, :, 1] = 8   # Very subtle green channel
+        tint[:, :, 0] = 12  # Very subtle blue channel
+        frame = cv2.add(frame, tint)
+
+        return frame
+
+    def _apply_flash(self, frame):
+        """
+        Brief white flash on 3D conversion to signal the transition.
+        Fades over _transition_frames frames.
+        """
+        intensity = int(self._transition_frames * 6)
+        flash     = np.full_like(frame, intensity, dtype=np.uint8)
+        return cv2.add(frame, flash)
+
+    def draw_hud(self, frame):
+        """Mode indicator in top area."""
+        from utils.overlay_utils import draw_text_with_bg
+
+        if self.mode == "3d":
+            draw_text_with_bg(frame, "MODE: 3D  [t=toggle  r=reset rot  z/x=depth]",
+                              (frame.shape[1] // 2 - 200, 28),
+                              font_scale=0.55,
+                              text_color=(0, 255, 255),
+                              bg_color=(0, 0, 80))
+        elif self.mode == "canvas":
+            draw_text_with_bg(frame, "MODE: CANVAS  [t=convert to 3D]",
+                              (frame.shape[1] // 2 - 150, 28),
+                              font_scale=0.55,
+                              text_color=(180, 180, 180),
+                              bg_color=(0, 0, 0))
+        return frame
