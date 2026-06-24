@@ -6716,6 +6716,7 @@ My Year of Study: ${yearOfStudy}
   const [uploadedResearchFiles, setUploadedResearchFiles] = useState<Record<string, File>>({})
   const [selectedResearchFileId, setSelectedResearchFileId] = useState<string | null>(null)
   const [activeMemorialWorkflow, setActiveMemorialWorkflow] = useState<any>(null)
+  const [selectedMemorialExportSide, setSelectedMemorialExportSide] = useState<'petitioner' | 'respondent'>('petitioner')
 
   const runMemorialBlueprintFromCurrentFile = async () => {
     const selectedFileRecord = sessionFiles.find((file: any) => file.id === selectedResearchFileId && file.docCategory === 'Moot Proposition')
@@ -7716,27 +7717,43 @@ ${authorities.map((a: any) => `- ${a.type || 'authority'} | ${a.issueId || ''} |
       throw new Error(await response.text());
     }
     const result = await response.json();
-    setActiveMemorialWorkflow(result);
+    // Preserve a memorial already generated for the opposite side. A side-specific
+    // generation response must not erase the previously generated memorial.
+    const mergedResult = {
+      ...(activeMemorialWorkflow || {}),
+      ...result,
+      petitioner: result?.petitioner || activeMemorialWorkflow?.petitioner,
+      respondent: result?.respondent || activeMemorialWorkflow?.respondent,
+    };
+    setActiveMemorialWorkflow(mergedResult);
     setActiveResearchReport({
-      id: result?.dossier?.id || `memorial-${Date.now()}`,
-      title: result?.dossier?.sourceName || selectedFileObject?.name || selectedFileRecord?.name || 'Moot Memorial',
+      id: mergedResult?.dossier?.id || `memorial-${Date.now()}`,
+      title: mergedResult?.dossier?.sourceName || selectedFileObject?.name || selectedFileRecord?.name || 'Moot Memorial',
       researchMode: 'Moot Court',
-      summary: buildMemorialResearchSummary(result),
-      sources: (result?.authorities || []).map((authority: any) => ({
+      summary: buildMemorialResearchSummary(mergedResult),
+      sources: (mergedResult?.authorities || []).map((authority: any) => ({
         title: authority.citation || authority.name || 'Authority',
         citation: authority.citation || '',
         court: authority.court || '',
         year: authority.year || '',
       })),
-      memorialWorkflow: result,
+      memorialWorkflow: mergedResult,
     } as any);
     setResearchStatus('Backend memorial workflow completed. Export options are ready.');
-    return result;
+    return mergedResult;
   };
 
   const getMemorialExportMarkdown = (workflow: any, side: 'petitioner' | 'respondent' = 'petitioner') => {
-    const selected = workflow?.[side] || workflow?.petitioner || workflow?.respondent;
+    // Never silently fall back to the opposite side. That previously caused a
+    // Respondent download to contain the Petitioner memorial.
+    const selected = workflow?.[side];
     return String(selected?.markdown || selected?.sections?.map((section: any) => `# ${section.title}\n\n${section.content}`).join('\n\n') || '');
+  };
+
+  const selectMemorialSide = (side: 'petitioner' | 'respondent') => {
+    setSelectedMemorialExportSide(side);
+    setActiveWorkspaceTab(side);
+    setActiveSectionId('cover_page');
   };
 
   const exportMemorialPdfFromWorkflow = async (workflow: any, side: 'petitioner' | 'respondent' = 'petitioner') => {
@@ -7826,8 +7843,18 @@ ${authorities.map((a: any) => `- ${a.type || 'authority'} | ${a.issueId || ''} |
     if (uploadCategory === 'Moot Proposition') {
       try {
         setResearchStatus(`Preparing ${option} through Memorial Architect backend workflow...`);
-        const workflow = activeMemorialWorkflow || await runMemorialWorkflowFromCurrentFile('both');
-        const side = activeWorkspaceTab === 'respondent' ? 'respondent' : 'petitioner';
+        const side = selectedMemorialExportSide;
+        let workflow = activeMemorialWorkflow;
+
+        // Generate the selected side on demand when only the opposite memorial
+        // exists in the current workspace. This keeps both downloads independent.
+        if (!getMemorialExportMarkdown(workflow, side).trim()) {
+          workflow = await runMemorialWorkflowFromCurrentFile(side);
+        }
+        if (!getMemorialExportMarkdown(workflow, side).trim()) {
+          throw new Error(`${side === 'respondent' ? 'Respondent' : 'Petitioner'} memorial was not returned by the backend.`);
+        }
+
         if (option === 'PDF') {
           await exportMemorialPdfFromWorkflow(workflow, side);
           setResearchStatus(`${side === 'respondent' ? 'Respondent' : 'Petitioner'} PDF downloaded.`);
@@ -17117,10 +17144,7 @@ ${assessmentBody}
                                       type="button"
                                       className={`btn ${activeWorkspaceTab === 'petitioner' ? 'btn-primary' : 'btn-ghost'}`}
                                       style={{ padding: '8px 16px', fontSize: '0.8rem', borderRadius: '8px', border: 'none', cursor: 'pointer' }}
-                                      onClick={() => {
-                                        setActiveWorkspaceTab('petitioner');
-                                        setActiveSectionId('cover_page');
-                                      }}
+                                      onClick={() => selectMemorialSide('petitioner')}
                                     >
                                       <FileText size={14} style={{ marginRight: '6px', verticalAlign: 'middle' }} />
                                       Petitioner Memorial
@@ -17129,10 +17153,7 @@ ${assessmentBody}
                                       type="button"
                                       className={`btn ${activeWorkspaceTab === 'respondent' ? 'btn-primary' : 'btn-ghost'}`}
                                       style={{ padding: '8px 16px', fontSize: '0.8rem', borderRadius: '8px', border: 'none', cursor: 'pointer' }}
-                                      onClick={() => {
-                                        setActiveWorkspaceTab('respondent');
-                                        setActiveSectionId('cover_page');
-                                      }}
+                                      onClick={() => selectMemorialSide('respondent')}
                                     >
                                       <FileText size={14} style={{ marginRight: '6px', verticalAlign: 'middle' }} />
                                       Respondent Memorial
@@ -17171,8 +17192,14 @@ ${assessmentBody}
                                             const side = option.id === 'generate_petitioner' ? 'petitioner' : option.id === 'generate_respondent' ? 'respondent' : 'both';
                                             setResearchStatus(`Running backend memorial workflow for ${side}...`);
                                             await runMemorialWorkflowFromCurrentFile(side as any);
-                                            setActiveWorkspaceTab(option.id === 'generate_respondent' ? 'respondent' : option.id === 'generate_both' ? 'comparison' : 'petitioner');
-                                            setActiveSectionId('cover_page');
+                                            if (option.id === 'generate_respondent') {
+                                              selectMemorialSide('respondent');
+                                            } else if (option.id === 'generate_petitioner') {
+                                              selectMemorialSide('petitioner');
+                                            } else {
+                                              setActiveWorkspaceTab('comparison');
+                                              setActiveSectionId('cover_page');
+                                            }
                                           } catch (error: any) {
                                             console.error('Memorial generation failed', error);
                                             setResearchStatus(`Memorial generation failed: ${error?.message || error}`);
@@ -18817,8 +18844,54 @@ ${assessmentBody}
               <aside className="research-panel research-right">
                 <div className="research-side-section">
                   <h4>Export Options</h4>
-                  <button type="button" onClick={() => exportResearch('PDF')}><Download size={14} />Download PDF Report</button>
-                  <button type="button" onClick={() => exportResearch('DOCX')}><Download size={14} />Download DOCX Report</button>
+                  {uploadCategory === 'Moot Proposition' && (
+                    <div style={{ marginBottom: '12px' }}>
+                      <div
+                        role="radiogroup"
+                        aria-label="Memorial side to preview and export"
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: '1fr 1fr',
+                          gap: '4px',
+                          padding: '4px',
+                          border: '1px solid var(--line)',
+                          borderRadius: '10px',
+                          background: 'rgba(0,0,0,0.22)',
+                        }}
+                      >
+                        {(['petitioner', 'respondent'] as const).map((side) => {
+                          const selected = selectedMemorialExportSide === side;
+                          const selectedColor = side === 'petitioner' ? '#1D4ED8' : '#B91C1C';
+                          return (
+                            <button
+                              key={side}
+                              type="button"
+                              role="radio"
+                              aria-checked={selected}
+                              onClick={() => selectMemorialSide(side)}
+                              style={{
+                                padding: '8px 10px',
+                                borderRadius: '7px',
+                                border: selected ? `1px solid ${selectedColor}` : '1px solid transparent',
+                                background: selected ? selectedColor : 'transparent',
+                                color: selected ? '#FFFFFF' : 'var(--text-soft)',
+                                fontWeight: 800,
+                                cursor: 'pointer',
+                                transition: 'all 160ms ease',
+                              }}
+                            >
+                              {side === 'petitioner' ? 'Petitioner' : 'Respondent'}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p style={{ margin: '7px 2px 0', fontSize: '0.72rem', color: 'var(--text-soft)', lineHeight: 1.45 }}>
+                        Previewing and exporting the <strong style={{ color: selectedMemorialExportSide === 'petitioner' ? '#60A5FA' : '#F87171' }}>{selectedMemorialExportSide}</strong> memorial.
+                      </p>
+                    </div>
+                  )}
+                  <button type="button" onClick={() => exportResearch('PDF')}><Download size={14} />Download {uploadCategory === 'Moot Proposition' ? `${selectedMemorialExportSide === 'petitioner' ? 'Petitioner' : 'Respondent'} PDF` : 'PDF Report'}</button>
+                  <button type="button" onClick={() => exportResearch('DOCX')}><Download size={14} />Download {uploadCategory === 'Moot Proposition' ? `${selectedMemorialExportSide === 'petitioner' ? 'Petitioner' : 'Respondent'} DOCX` : 'DOCX Report'}</button>
                   <button type="button" onClick={() => exportResearch('Citation Table')}><Download size={14} />Download Citation Sheet</button>
                   <button type="button" onClick={() => exportResearch('Source Bundle')}><Download size={14} />Download Source Bundle</button>
                   {uploadCategory === 'Judgment' && (
